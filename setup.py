@@ -227,7 +227,7 @@ if __name__ == '__main__':
         'console_scripts': [
             'kernprof=kernprof:main',
         ],
-    },
+    }
     setupkw["name"] = NAME
     setupkw["version"] = VERSION
     setupkw["author"] = "Robert Kern"
