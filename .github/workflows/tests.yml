@@ -33,27 +33,85 @@ jobs:
         python -m pip install mypy
         mypy --install-types --non-interactive ./line_profiler
         mypy ./line_profiler
-  build_binary_wheels:
+  build_and_test_sdist:
+    name: Test sdist Python 3.8
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v3
+    - name: Set up Python 3.8
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.8
+    - name: Upgrade pip
+      run: |-
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements/tests.txt
+        python -m pip install -r requirements/runtime.txt
+        true
+    - name: Build sdist
+      shell: bash
+      run: |-
+        python -m pip install pip -U
+        python -m pip install setuptools>=0.8 wheel build
+        python -m build --sdist --outdir wheelhouse
+    - name: Install sdist
+      run: |-
+        ls -al ./wheelhouse
+        pip install wheelhouse/line_profiler*.tar.gz -v
+    - name: Test minimal loose sdist
+      run: |-
+        pwd
+        ls -al
+        MOD_DPATH=$(python -c "import line_profiler, os; print(os.path.dirname(line_profiler.__file__))")
+        echo "MOD_DPATH = $MOD_DPATH"
+        python -m pytest --cov=line_profiler $MOD_DPATH ./tests
+    - name: Test full loose sdist
+      run: |-
+        pwd
+        ls -al
+        python -m pip install -r requirements/optional.txt
+        true
+        MOD_DPATH=$(python -c "import line_profiler, os; print(os.path.dirname(line_profiler.__file__))")
+        echo "MOD_DPATH = $MOD_DPATH"
+        # Run in a sandboxed directory
+        WORKSPACE_DNAME="testsrcdir_${CI_PYTHON_VERSION}_${GITHUB_RUN_ID}_${RUNNER_OS}"
+        mkdir -p $WORKSPACE_DNAME
+        cd $WORKSPACE_DNAME
+        # Run the tests
+        # Get path to installed package
+        MOD_DPATH=$(python -c "import line_profiler, os; print(os.path.dirname(line_profiler.__file__))")
+        echo "MOD_DPATH = $MOD_DPATH"
+        python -m pytest $MOD_DPATH ../tests
+        cd ..
+    - name: Upload sdist artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: wheels
+        path: ./wheelhouse/*.tar.gz
+  build_and_test_binpy_wheels:
     name: ${{ matrix.os }}, arch=${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: ["windows-latest", "ubuntu-latest", "macOS-latest"]
+        cibw_skip: ["cp3*-win32"]
+        cibw_build: ["cp3*-*"]
+        arch: [auto]
         include:
         - os: windows-latest
+          cibw_build: cp3*-win32
           arch: auto
-        - os: ubuntu-latest
-          arch: auto
-        - os: macOS-latest
-          arch: auto
+          cibw_skip: ''
     steps:
     - name: Checkout source
       uses: actions/checkout@v3
     - name: Enable MSVC 64bit
       uses: ilammy/msvc-dev-cmd@v1
-      if: matrix.os == 'windows-latest' && matrix.cibw_build != 'cp3*-win32'
+      if: matrix.os == 'windows-latest' && matrix.cibw_build == 'cp3*-win32'
     - name: Enable MSVC 32bit
       uses: ilammy/msvc-dev-cmd@v1
-      if: matrix.os == 'windows-latest' && matrix.cibw_build == 'cp3*-win32'
+      if: matrix.os == 'windows-latest' && matrix.cibw_build != 'cp3*-win32'
       with:
         arch: x86
     - name: Install Xcode
@@ -73,6 +131,8 @@ jobs:
         config-file: pyproject.toml
       env:
         CIBW_BUILD_VERBOSITY: 1
+        CIBW_SKIP: ${{ matrix.cibw_skip }}
+        CIBW_BUILD: ${{ matrix.cibw_build }}
         CIBW_TEST_REQUIRES: -r requirements/tests.txt
         CIBW_TEST_COMMAND: python {project}/run_tests.py
         CIBW_ARCHS_LINUX: ${{ matrix.arch }}
@@ -113,7 +173,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && ! startsWith(github.event.ref, 'refs/tags') && ! startsWith(github.event.ref, 'refs/heads/release')
     needs:
-    - build_binary_wheels
+    - build_and_test_sdist
+    - build_and_test_binpy_wheels
     steps:
     - name: Checkout source
       uses: actions/checkout@v3
@@ -156,7 +217,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && (startsWith(github.event.ref, 'refs/tags') || startsWith(github.event.ref, 'refs/heads/release'))
     needs:
-    - build_binary_wheels
+    - build_and_test_sdist
+    - build_and_test_binpy_wheels
     steps:
     - name: Checkout source
       uses: actions/checkout@v3
