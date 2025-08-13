@@ -294,7 +294,6 @@ if __name__ == '__main__':
     setupkw["classifiers"] = [
         'Development Status :: 5 - Production/Stable',
         'Intended Audience :: Developers',
-        'License :: OSI Approved :: BSD License',
         'Operating System :: OS Independent',
         'Programming Language :: C',
         'Programming Language :: Python',
