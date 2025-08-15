@@ -325,21 +325,21 @@ class _ParseParamResult:
         """ Defers to :py:attr:`_ParseParamResult.opts`."""
         return self.opts[key]
 
-    @cached_property
+    @functools.cached_property
     def dump_raw_dest(self):  # type: () -> Path | None
         path = self.opts.D[0]
         if path:
             return Path(path)
         return None
 
-    @cached_property
+    @functools.cached_property
     def dump_text_dest(self):  # type: () -> Path | None
         path = self.opts.T[0]
         if path:
             return Path(path)
         return None
 
-    @cached_property
+    @functools.cached_property
     def output_unit(self):  # type: () -> float | None
         if self.opts.u is None:
             return None
@@ -348,11 +348,11 @@ class _ParseParamResult:
         except Exception:
             raise TypeError("Timer unit setting must be a float.")
 
-    @cached_property
+    @functools.cached_property
     def strip_zero(self):  # type: () -> bool
         return "z" in self.opts
 
-    @cached_property
+    @functools.cached_property
     def return_profiler(self):  # type: () -> bool
         return "r" in self.opts
 
@@ -367,17 +367,61 @@ class _RunAndProfileResult:
     return_value: Any
     message: Union[str, None] = None
     time_elapsed: Union[float, None] = None
+    tempfile: Union[str, 'os.PathLike[str]', None] = None
 
     def __post_init__(self):
+        if self.tempfile is not None:
+            self.tempfile = Path(self.tempfile)
         self.output  # Fetch value
 
-    @cached_property
+    def _make_show_func_wrapper(self, show_func):
+        """
+        Create a replacement for
+        :py:func:`line_profiler.line_profiler.show_func` to be
+        monkey-patched in, so that when showing the results of the
+        entire cell the lines are not truncated at the end of the first
+        code block.
+        """
+        tmp = self.tempfile
+        if tmp is None:
+            return show_func
+        assert isinstance(tmp, Path)
+
+        @functools.wraps(show_func)
+        def show_func_wrapper(
+                filename, start_lineno, func_name, *args, **kwargs):
+            call = functools.partial(show_func,
+                                     filename, start_lineno, func_name,
+                                     *args, **kwargs)
+            show_entire_module = (start_lineno == 1
+                                  and func_name == _LPRUN_ALL_CODE_OBJ_NAME
+                                  and tmp is not None
+                                  and tmp.samefile(filename))
+            if not show_entire_module:
+                return call()
+            with _PatchDict.from_module(
+                    line_profiler, get_code_block=get_code_block_wrapper):
+                return call()
+
+        def get_code_block_wrapper(filename, lineno):
+            """ Return the entire content of :py:attr:`~.tempfile`."""
+            with tmp.open(mode='r') as fobj:
+                return fobj.read().splitlines(keepends=True)
+
+        return show_func_wrapper
+
+    @functools.cached_property
     def output(self):  # type: () -> str
-        with StringIO() as capture:  # Trap text output
-            self.stats.print(capture,
+        with ExitStack() as stack:
+            cap = stack.enter_context(StringIO())  # Trap text output
+            patch_show_func = _PatchDict.from_module(
+                line_profiler,
+                show_func=self._make_show_func_wrapper(line_profiler.show_func))
+            stack.enter_context(patch_show_func)
+            self.stats.print(cap,
                              output_unit=self.parse_result.output_unit,
                              stripzeros=self.parse_result.strip_zero)
-            return capture.getvalue().rstrip()
+            return cap.getvalue().rstrip()
 
 
 class _PatchProfilerIntoBuiltins:
@@ -397,25 +441,57 @@ class _PatchProfilerIntoBuiltins:
         AttributeError: ...
     """
     def __init__(self, prof=None):
-        self.prof = prof or LineProfiler()  # type: LineProfiler
-        self._namespace = vars(builtins)  # type: dict[str, Any]
-        self._state = False, None  # type: tuple[bool, Any]
+        # type: (LineProfiler | None) -> None
+        if prof is None:
+            prof = LineProfiler()
+        self.prof = prof
+        self._ctx = _PatchDict.from_module(builtins, profile=self.prof)
 
     def __enter__(self):  # type: () -> LineProfiler
-        try:
-            self._state = True, self._namespace['profile']
-        except KeyError:
-            self._state = False, None
-        # Add the profiler to the builtins for @profile.
-        self._namespace['profile'] = self.prof
+        self._ctx.__enter__()
         return self.prof
 
+    def __exit__(self, *a, **k):
+        return self._ctx.__exit__(*a, **k)
+
+
+class _PatchDict:
+    def __init__(self, namespace, /, **kwargs):
+        # type: (dict[str, Any], Any) -> None
+        self.namespace = namespace
+        self.replacements = kwargs
+        self._stack = []  # type: list[dict[str, Any]]
+        self._absent = object()
+
+    def __enter__(self):  # type: (PD) -> PD
+        self._push()
+        return self
+
     def __exit__(self, *_, **__):
-        self._state, (had_profile, old_profile) = (False, None), self._state
-        if had_profile:
-            self._namespace['profile'] = old_profile
-        else:
-            self._namespace.pop('profile', None)
+        self._pop()
+
+    def _push(self):
+        entry = {}
+        namespace = self.namespace
+        absent = self._absent
+        for key, value in self.replacements.items():
+            entry[key] = namespace.pop(key, absent)
+            namespace[key] = value
+        self._stack.append(entry)
+
+    def _pop(self):
+        namespace = self.namespace
+        absent = self._absent
+        for key, value in self._stack.pop().items():
+            if value is absent:
+                namespace.pop(key, None)
+            else:
+                namespace[key] = value
+
+    @classmethod
+    def from_module(cls, module, /, **kwargs):
+        # type: (type[PD], types.ModuleType, Any) -> PD
+        return cls(vars(module), **kwargs)
 
 
 @magics_class
