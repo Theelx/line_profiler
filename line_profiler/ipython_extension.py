@@ -321,10 +321,6 @@ class _ParseParamResult:
         """ Defers to :py:attr:`_ParseParamResult.opts`."""
         return getattr(self.opts, attr)
 
-    def __getitem__(self, key):  # type: (str) -> Any
-        """ Defers to :py:attr:`_ParseParamResult.opts`."""
-        return self.opts[key]
-
     @functools.cached_property
     def dump_raw_dest(self):  # type: () -> Path | None
         path = self.opts.D[0]
@@ -364,7 +360,6 @@ class _RunAndProfileResult:
     """
     stats: LineStats
     parse_result: _ParseParamResult
-    return_value: Any
     message: Union[str, None] = None
     time_elapsed: Union[float, None] = None
     tempfile: Union[str, 'os.PathLike[str]', None] = None
