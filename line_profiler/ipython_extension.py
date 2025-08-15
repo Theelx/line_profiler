@@ -35,19 +35,22 @@ help mechanism::
 
 import ast
 import builtins
+import functools
 import os
 import tempfile
 import textwrap
 import time
+import types
+from contextlib import ExitStack
 from dataclasses import dataclass
-from functools import cached_property, partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
 if TYPE_CHECKING:
-    from types import CodeType  # noqa: F401
-    from typing import Callable, ParamSpec, ClassVar, TypeVar  # noqa: F401
+    from typing import (Callable, ParamSpec,  # noqa: F401
+                        ClassVar, TypeVar)
 
     PS = ParamSpec('PS')
+    PD = TypeVar('PD', bound='_PatchDict')
     DefNode = TypeVar('DefNode', ast.FunctionDef, ast.AsyncFunctionDef)
 
 from io import StringIO
@@ -58,12 +61,14 @@ from IPython.core.page import page
 from IPython.utils.ipstruct import Struct
 from IPython.core.error import UsageError
 
-from line_profiler import LineProfiler, LineStats
+from line_profiler import line_profiler, LineProfiler, LineStats
 from line_profiler.autoprofile.ast_tree_profiler import AstTreeProfiler
 from line_profiler.autoprofile.ast_profile_transformer import AstProfileTransformer
 
 
 __all__ = ('LineProfilerMagics',)
+
+_LPRUN_ALL_CODE_OBJ_NAME = '<lprof_cell>'
 
 
 # This is used for profiling all the code within a cell with lprun_all
@@ -210,21 +215,21 @@ class _ParseParamResult:
         """ Defers to :py:attr:`_ParseParamResult.opts`."""
         return self.opts[key]
 
-    @cached_property
+    @functools.cached_property
     def dump_raw_dest(self):  # type: () -> Path | None
         path = self.opts.D[0]
         if path:
             return Path(path)
         return None
 
-    @cached_property
+    @functools.cached_property
     def dump_text_dest(self):  # type: () -> Path | None
         path = self.opts.T[0]
         if path:
             return Path(path)
         return None
 
-    @cached_property
+    @functools.cached_property
     def output_unit(self):  # type: () -> float | None
         if self.opts.u is None:
             return None
@@ -233,11 +238,11 @@ class _ParseParamResult:
         except Exception:
             raise TypeError("Timer unit setting must be a float.")
 
-    @cached_property
+    @functools.cached_property
     def strip_zero(self):  # type: () -> bool
         return "z" in self.opts
 
-    @cached_property
+    @functools.cached_property
     def return_profiler(self):  # type: () -> bool
         return "r" in self.opts
 
@@ -252,17 +257,61 @@ class _RunAndProfileResult:
     return_value: Any
     message: Union[str, None] = None
     time_elapsed: Union[float, None] = None
+    tempfile: Union[str, 'os.PathLike[str]', None] = None
 
     def __post_init__(self):
+        if self.tempfile is not None:
+            self.tempfile = Path(self.tempfile)
         self.output  # Fetch value
 
-    @cached_property
+    def _make_show_func_wrapper(self, show_func):
+        """
+        Create a replacement for
+        :py:func:`line_profiler.line_profiler.show_func` to be
+        monkey-patched in, so that when showing the results of the
+        entire cell the lines are not truncated at the end of the first
+        code block.
+        """
+        tmp = self.tempfile
+        if tmp is None:
+            return show_func
+        assert isinstance(tmp, Path)
+
+        @functools.wraps(show_func)
+        def show_func_wrapper(
+                filename, start_lineno, func_name, *args, **kwargs):
+            call = functools.partial(show_func,
+                                     filename, start_lineno, func_name,
+                                     *args, **kwargs)
+            show_entire_module = (start_lineno == 1
+                                  and func_name == _LPRUN_ALL_CODE_OBJ_NAME
+                                  and tmp is not None
+                                  and tmp.samefile(filename))
+            if not show_entire_module:
+                return call()
+            with _PatchDict.from_module(
+                    line_profiler, get_code_block=get_code_block_wrapper):
+                return call()
+
+        def get_code_block_wrapper(filename, lineno):
+            """ Return the entire content of :py:attr:`~.tempfile`."""
+            with tmp.open(mode='r') as fobj:
+                return fobj.read().splitlines(keepends=True)
+
+        return show_func_wrapper
+
+    @functools.cached_property
     def output(self):  # type: () -> str
-        with StringIO() as capture:  # Trap text output
-            self.stats.print(capture,
+        with ExitStack() as stack:
+            cap = stack.enter_context(StringIO())  # Trap text output
+            patch_show_func = _PatchDict.from_module(
+                line_profiler,
+                show_func=self._make_show_func_wrapper(line_profiler.show_func))
+            stack.enter_context(patch_show_func)
+            self.stats.print(cap,
                              output_unit=self.parse_result.output_unit,
                              stripzeros=self.parse_result.strip_zero)
-            return capture.getvalue().rstrip()
+            return cap.getvalue().rstrip()
 
 
 class _PatchProfilerIntoBuiltins:
@@ -282,25 +331,57 @@ class _PatchProfilerIntoBuiltins:
         AttributeError: ...
     """
     def __init__(self, prof=None):
-        self.prof = prof or LineProfiler()  # type: LineProfiler
-        self._namespace = vars(builtins)  # type: dict[str, Any]
-        self._state = False, None  # type: tuple[bool, Any]
+        # type: (LineProfiler | None) -> None
+        if prof is None:
+            prof = LineProfiler()
+        self.prof = prof
+        self._ctx = _PatchDict.from_module(builtins, profile=self.prof)
 
     def __enter__(self):  # type: () -> LineProfiler
-        try:
-            self._state = True, self._namespace['profile']
-        except KeyError:
-            self._state = False, None
-        # Add the profiler to the builtins for @profile.
-        self._namespace['profile'] = self.prof
+        self._ctx.__enter__()
         return self.prof
 
+    def __exit__(self, *a, **k):
+        return self._ctx.__exit__(*a, **k)
+
+
+class _PatchDict:
+    def __init__(self, namespace, /, **kwargs):
+        # type: (dict[str, Any], Any) -> None
+        self.namespace = namespace
+        self.replacements = kwargs
+        self._stack = []  # type: list[dict[str, Any]]
+        self._absent = object()
+
+    def __enter__(self):  # type: (PD) -> PD
+        self._push()
+        return self
+
     def __exit__(self, *_, **__):
-        self._state, (had_profile, old_profile) = (False, None), self._state
-        if had_profile:
-            self._namespace['profile'] = old_profile
-        else:
-            self._namespace.pop('profile', None)
+        self._pop()
+
+    def _push(self):
+        entry = {}
+        namespace = self.namespace
+        absent = self._absent
+        for key, value in self.replacements.items():
+            entry[key] = namespace.pop(key, absent)
+            namespace[key] = value
+        self._stack.append(entry)
+
+    def _pop(self):
+        namespace = self.namespace
+        absent = self._absent
+        for key, value in self._stack.pop().items():
+            if value is absent:
+                namespace.pop(key, None)
+            else:
+                namespace[key] = value
+
+    @classmethod
+    def from_module(cls, module, /, **kwargs):
+        # type: (type[PD], types.ModuleType, Any) -> PD
+        return cls(vars(module), **kwargs)
 
 
 @magics_class
@@ -319,6 +400,7 @@ class LineProfilerMagics(Magics):
     @staticmethod
     def _run_and_profile(prof,  # type: LineProfiler
                          parse_result,  # type: _ParseParamResult
+                         tempfile,  # type: str | None
                          method,  # type: Callable[PS, Any]
                          *args,  # type: PS.args
                          **kwargs,  # type: PS.kwargs
@@ -338,30 +420,24 @@ class LineProfilerMagics(Magics):
         # Capture and save total runtime
         total_time = time.perf_counter() - start_time
         return _RunAndProfileResult(
-            prof.get_stats(), parse_result, return_value, message, total_time)
+            prof.get_stats(), parse_result, return_value,
+            message=message, time_elapsed=total_time, tempfile=tempfile)
 
     @classmethod
     def _lprun_all_get_rewritten_profiled_code(cls, tmpfile):
-        # type: (str) -> CodeType
-        # Run the AST transformer on the temp file, while skipping the
-        # wrapper function.
-        get_transformer = partial(SkipWrapper,
-                                  wrapper_name=cls._lprof_all_fname)
-        at = AstTreeProfiler(
-            tmpfile,
-            [tmpfile],
-            profile_imports=False,
-            ast_transformer_class_handler=get_transformer)  # type: ignore[arg-type]
+        # type: (str) -> types.CodeType
+        """ Transform and compile the AST of the profiled code.  This is
+        similar to :py:meth:`.LineProfiler.runctx`,
+        """
+        at = AstTreeProfiler(tmpfile, [tmpfile], profile_imports=False)
         tree = at.profile()
 
-        # Compile and exec that AST. This is similar to `prof.runctx`,
-        # but that doesn't support executing AST.
         return compile(tree, tmpfile, "exec")
 
     @classmethod
     def _lprun_get_top_level_profiled_code(cls, tmpfile):
-        # type: (str) -> CodeType
-        # Compile and define the function from that file.
+        # type: (str) -> types.CodeType
+        """ Compile the profiled code."""
         with open(tmpfile, mode='r') as fobj:
             return compile(fobj.read(), tmpfile, "exec")
 
@@ -468,7 +544,7 @@ class LineProfilerMagics(Magics):
 
         with _PatchProfilerIntoBuiltins(profile):
             run = self._run_and_profile(
-                profile, parsed, profile.runctx, parsed.arg_str,
+                profile, parsed, None, profile.runctx, parsed.arg_str,
                 globals=global_ns, locals=local_ns)
 
         return self._handle_end(profile, run)
@@ -522,19 +598,15 @@ class LineProfilerMagics(Magics):
         parsed = self._parse_parameters(parameter_s, "rzptD:T:u:", opts_def)
 
         ip = get_ipython()
-        # We have to encase the cell being profiled in an outer function
-        # if we want this to work.
         if not cell.strip():  # Edge case
-            cell = '...'
-        indented = textwrap.indent(cell, "    ")
-        fsrc = f"def {self._lprof_all_fname}():\n{indented}"
+            cell = "..."
 
         # Write the cell to a temporary file so `show_text()` inside
         # `print_stats()` can open it.
         with tempfile.NamedTemporaryFile(
             suffix=".py", delete=False, mode="w", encoding="utf-8"
         ) as tf:
-            tf.write(fsrc)
+            tf.write(textwrap.dedent(cell).strip('\n'))
 
         try:
             if "p" not in parsed.opts:  # This is the default case.
@@ -543,22 +615,36 @@ class LineProfilerMagics(Magics):
                 get_code = self._lprun_get_top_level_profiled_code
             # Inject a fresh LineProfiler into @profile.
             with _PatchProfilerIntoBuiltins() as prof:
-                # We don't define `ip.user_global_ns` and `ip.user_ns`
-                # at the beginning like in lprun because the ns changes
-                # after the previous compile call.
-                exec(get_code(tf.name), ip.user_global_ns, ip.user_ns)
+                code = get_code(tf.name).replace(
+                    co_name=_LPRUN_ALL_CODE_OBJ_NAME)
                 try:
-                    # Grab and call the wrapper so it actually runs
-                    # under @profile.
-                    func = ip.user_ns[self._lprof_all_fname]
-                except KeyError:
-                    raise RuntimeError(
-                        f"No function {self._lprof_all_fname!r} defined "
-                        "after AST transform") from None
-                prof.add_function(func)
-                # This method fetches the `LineProfiler.print_stats()`
-                # output before the `os.unlink()` below happens
-                run = self._run_and_profile(prof, parsed, prof.runcall, func)
+                    code = code.replace(
+                        co_qualname=_LPRUN_ALL_CODE_OBJ_NAME)
+                except TypeError:  # Python < 3.11
+                    pass
+                # "Register" the profiled code object with the profiler
+                # Notes:
+                # - This uses a dummy "function" object in a hacky way,
+                #   but it's OK since `add_function()` ultimately only
+                #   looks at the object's `.__code__` or
+                #   `.__func__.__code__`.
+                # - `prof.add_function()` might have replaced the code
+                #   object, so retrieve it back from the dummy function
+                mock_func = types.SimpleNamespace(__code__=code)
+                prof.add_function(mock_func)  # type: ignore[arg-type]
+                code = mock_func.__code__
+                # Notes:
+                # - We don't define `ip.user_global_ns` and `ip.user_ns`
+                #   at the beginning like in lprun because the ns
+                #   changes after the previous compile call.
+                # - The method `._run_and_profile()` fetches the
+                #   `LineProfiler.print_stats()` output before the
+                #   `os.unlink()` below happens, allowing for transient
+                #   items to be profiled.
+                with prof:
+                    run = self._run_and_profile(
+                        prof, parsed, tf.name, exec, code,
+                        globals=ip.user_global_ns, locals=ip.user_ns)
         finally:
             os.unlink(tf.name)
         if "t" in parsed.opts:
@@ -568,5 +654,3 @@ class LineProfilerMagics(Magics):
             ip.user_ns["_total_time_taken"] = run.time_elapsed
 
         return self._handle_end(prof, run)
-
-    _lprof_all_fname = "_lprof_cell"  # type: ClassVar[str]
