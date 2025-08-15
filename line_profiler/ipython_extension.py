@@ -283,6 +283,141 @@ class _PatchDict:
         return cls(vars(module), **kwargs)
 
 
+@dataclass
+class _ParseParamResult:
+    """ Class for holding parsed info relevant to the behaviors of both
+    the ``%lprun`` and ``%%lprun_all`` magics.
+
+    Attributes:
+        ``.opts``
+            :py:class:`IPython.utils.ipstruct.Struct` object.
+        ``.arg_str``
+            :py:class:`str` of unparsed argument(s).
+        ``.dump_raw_dest``
+            (Descriptor) :py:class:`pathlib.Path` to write the raw
+            (pickled) profiling results to, or :py:data:`None` if not to
+            be written.
+        ``.dump_text_dest``
+            (Descriptor) :py:class:`pathlib.Path` to write the
+            plain-text profiling results to, or :py:data:`None` if not
+            to be written.
+        ``.output_unit``
+            (Descriptor) Unit to normalize the output of
+            :py:meth:`line_profiler.LineProfiler.print_stats` to, or
+            :py:data:`None` if not specified.
+        ``.strip_zero``
+            (Descriptor) Whether to call
+            :py:meth:`line_profiler.LineProfiler.print_stats` with
+            ``stripzeros=True``.
+        ``.return_profiler``
+            (Descriptor) Whether the
+            :py:class:`line_profiler.LineProfiler` instance is to be
+            returned.
+    """
+    opts: Struct
+    arg_str: str
+
+    def __getattr__(self, attr):  # type: (str) -> Any
+        """ Defers to :py:attr:`_ParseParamResult.opts`."""
+        return getattr(self.opts, attr)
+
+    def __getitem__(self, key):  # type: (str) -> Any
+        """ Defers to :py:attr:`_ParseParamResult.opts`."""
+        return self.opts[key]
+
+    @cached_property
+    def dump_raw_dest(self):  # type: () -> Path | None
+        path = self.opts.D[0]
+        if path:
+            return Path(path)
+        return None
+
+    @cached_property
+    def dump_text_dest(self):  # type: () -> Path | None
+        path = self.opts.T[0]
+        if path:
+            return Path(path)
+        return None
+
+    @cached_property
+    def output_unit(self):  # type: () -> float | None
+        if self.opts.u is None:
+            return None
+        try:
+            return float(self.opts.u[0])
+        except Exception:
+            raise TypeError("Timer unit setting must be a float.")
+
+    @cached_property
+    def strip_zero(self):  # type: () -> bool
+        return "z" in self.opts
+
+    @cached_property
+    def return_profiler(self):  # type: () -> bool
+        return "r" in self.opts
+
+
+@dataclass
+class _RunAndProfileResult:
+    """ Class for holding the results of both the ``%lprun`` and
+    ``%%lprun_all`` magics.
+    """
+    stats: LineStats
+    parse_result: _ParseParamResult
+    return_value: Any
+    message: Union[str, None] = None
+    time_elapsed: Union[float, None] = None
+
+    def __post_init__(self):
+        self.output  # Fetch value
+
+    @cached_property
+    def output(self):  # type: () -> str
+        with StringIO() as capture:  # Trap text output
+            self.stats.print(capture,
+                             output_unit=self.parse_result.output_unit,
+                             stripzeros=self.parse_result.strip_zero)
+            return capture.getvalue().rstrip()
+
+
+class _PatchProfilerIntoBuiltins:
+    """
+    Example:
+        >>> import builtins
+        >>> from line_profiler import LineProfiler
+        >>>
+        >>>
+        >>> prof = LineProfiler()
+        >>> with _PatchProfilerIntoBuiltins(prof):
+        ...     assert builtins.profile is prof
+        ...
+        >>> print(builtins.profile)
+        Traceback (most recent call last):
+          ...
+        AttributeError: ...
+    """
+    def __init__(self, prof=None):
+        self.prof = prof or LineProfiler()  # type: LineProfiler
+        self._namespace = vars(builtins)  # type: dict[str, Any]
+        self._state = False, None  # type: tuple[bool, Any]
+
+    def __enter__(self):  # type: () -> LineProfiler
+        try:
+            self._state = True, self._namespace['profile']
+        except KeyError:
+            self._state = False, None
+        # Add the profiler to the builtins for @profile.
+        self._namespace['profile'] = self.prof
+        return self.prof
+
+    def __exit__(self, *_, **__):
+        self._state, (had_profile, old_profile) = (False, None), self._state
+        if had_profile:
+            self._namespace['profile'] = old_profile
+        else:
+            self._namespace.pop('profile', None)
+
+
 @magics_class
 class LineProfilerMagics(Magics):
     def _parse_parameters(self, parameter_s, getopt_spec, opts_def):
