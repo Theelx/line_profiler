@@ -93,15 +93,14 @@ class TestLPRun(_TestIPython):
         """
         with tempdir() as tmpdir:
             if output:
-                out_path = tmpdir / output
-                more_flags = shlex.join(['-' + ('T' if text else 'D'),
-                                         str(out_path)])
+                more_flags = shlex.join(['-' + ('T' if text else 'D'), output])
             else:
                 more_flags = None
             self._test_lprun(request, more_flags)
 
             # Check the output files (`-D` or `-T`)
             if output:
+                out_path = tmpdir / output
                 assert out_path.exists()
                 assert out_path.stat().st_size
                 if not text:  # Test roundtripping
