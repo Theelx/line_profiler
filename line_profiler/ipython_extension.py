@@ -44,10 +44,10 @@ import types
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Union
-if TYPE_CHECKING:
+from typing import TYPE_CHECKING, Union
+if TYPE_CHECKING:  # pragma: no cover
     from typing import (Callable, ParamSpec,  # noqa: F401
-                        ClassVar, TypeVar)
+                        Any, ClassVar, TypeVar)
 
     PS = ParamSpec('PS')
     PD = TypeVar('PD', bound='_PatchDict')
@@ -63,114 +63,11 @@ from IPython.core.error import UsageError
 
 from line_profiler import line_profiler, LineProfiler, LineStats
 from line_profiler.autoprofile.ast_tree_profiler import AstTreeProfiler
-from line_profiler.autoprofile.ast_profile_transformer import AstProfileTransformer
 
 
 __all__ = ('LineProfilerMagics',)
 
 _LPRUN_ALL_CODE_OBJ_NAME = '<lprof_cell>'
-
-
-# This is used for profiling all the code within a cell with lprun_all
-class SkipWrapper(AstProfileTransformer):
-    """
-    AST Transformer that lets the base transformer add @profile everywhere, then
-    removes it from the wrapper function only. Helps resolve issues where only top-level
-    code would show timings.
-    """
-
-    def __init__(self, *args, wrapper_name, **kwargs):
-        # Yes, I know these look like ChatGPT-generated docstrings, but I wrote them
-        # in order to follow the format from ./autoprofile/ast_profile_transformer.py
-        """Initialize the transformer.
-
-        The base AstProfileTransformer is expected to add `@profile` to functions.
-        This subclass remembers the name of the generated wrapper function so we can
-        strip @profile off the wrapper function later because we only want to profile
-        the code inside the wrapper, not the wrapper itself.
-
-        Args:
-            wrapper_name (str): The exact name of the wrapper function whose
-                decorators should be cleaned.
-            *args: Positional args forwarded to the parent transformer.
-            **kwargs: Keyword args forwarded to the parent transformer.
-        """
-        super().__init__(*args, **kwargs)
-        self._wrapper_name = wrapper_name  # type: str
-
-    def _strip_profile_from_decorators(self, node):
-        # type: (DefNode) -> DefNode
-        """Remove any @profile decorator from a function node.
-
-        Handles both the bare decorator form (@profile) and the callable form
-        (@profile(...)). The node is modified in-place by filtering its
-        decorator_list.
-
-        Args:
-            node (ast.FunctionDef | ast.AsyncFunctionDef): The function node to clean.
-
-        Returns:
-            ast.AST: The same node instance, with @profile-related decorators removed.
-        """
-
-        def keep(d):
-            # Drop the decorator if it is exactly profile
-            if isinstance(d, ast.Name) and d.id == "profile":
-                return False
-            # Drop calls like @profile(...) too
-            if (
-                isinstance(d, ast.Call)
-                and isinstance(d.func, ast.Name)
-                and d.func.id == "profile"
-            ):
-                return False
-            # Keep the rest
-            return True
-
-        # Filter decorators in-place because NodeTransformer expects us to return the node
-        node.decorator_list = [d for d in node.decorator_list if keep(d)]
-        return node
-
-    def visit_FunctionDef(self, node):
-        # type: (ast.FunctionDef) -> ast.FunctionDef
-        """Visit a synchronous "def" function.
-
-        We first delegate to the base transformer so it can apply its logic
-        (e.g., adding @profile to functions). If the function happens to be the
-        special wrapper (self._wrapper_name), we remove the `@profile` decorator
-        from it so profiling reflects the code executed within the wrapper.
-
-        Args:
-            node (ast.FunctionDef): The function definition node.
-
-        Returns:
-            ast.FunctionDef: The possibly modified node.
-        """
-        node = super().visit_FunctionDef(node)
-        if isinstance(node, ast.FunctionDef) and node.name == self._wrapper_name:
-            node = self._strip_profile_from_decorators(node)
-        return node
-
-    # This isn't needed by our code because our _lprof_cell will never be async,
-    # but it's included in case a user needs to make it async to work with their code
-    def visit_AsyncFunctionDef(self, node):
-        # type: (ast.AsyncFunctionDef) -> ast.AsyncFunctionDef
-        """Visit an asynchronous "async def" function.
-
-        Mirrors visit_FunctionDef but for async functions. After the base
-        transformer adds @profile, we remove it from the wrapper function if
-        the names match.
-
-        Args:
-            node (ast.AsyncFunctionDef): The async function definition node.
-
-        Returns:
-            ast.AsyncFunctionDef: The possibly modified node.
-        """
-        node = super().visit_AsyncFunctionDef(node)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == self._wrapper_name:
-            node = self._strip_profile_from_decorators(node)
-        return node
 
 
 @dataclass
@@ -211,10 +108,6 @@ class _ParseParamResult:
         """ Defers to :py:attr:`_ParseParamResult.opts`."""
         return getattr(self.opts, attr)
 
-    def __getitem__(self, key):  # type: (str) -> Any
-        """ Defers to :py:attr:`_ParseParamResult.opts`."""
-        return self.opts[key]
-
     @functools.cached_property
     def dump_raw_dest(self):  # type: () -> Path | None
         path = self.opts.D[0]
@@ -254,7 +147,6 @@ class _RunAndProfileResult:
     """
     stats: LineStats
     parse_result: _ParseParamResult
-    return_value: Any
     message: Union[str, None] = None
     time_elapsed: Union[float, None] = None
     tempfile: Union[str, 'os.PathLike[str]', None] = None
@@ -411,7 +303,7 @@ class LineProfilerMagics(Magics):
         # `time()` that's intended for simple benchmarking.
         start_time = time.perf_counter()
         try:
-            return_value = method(*args, **kwargs)
+            method(*args, **kwargs)
             message = None
         except (SystemExit, KeyboardInterrupt) as e:
             message = (f"{type(e).__name__} exception caught in "
@@ -420,7 +312,7 @@ class LineProfilerMagics(Magics):
         # Capture and save total runtime
         total_time = time.perf_counter() - start_time
         return _RunAndProfileResult(
-            prof.get_stats(), parse_result, return_value,
+            prof.get_stats(), parse_result,
             message=message, time_elapsed=total_time, tempfile=tempfile)
 
     @classmethod
