@@ -3,13 +3,13 @@ This module defines the |lprun| and |lprun_all| IPython magic functions.
 
 If you are using IPython, there is an implementation of an |lprun| magic
 command which will let you specify functions to profile and a statement
-to execute.  It will also add its
+to execute. It will also add its
 :py:class:`~.LineProfiler` instance into the |builtins|, but typically,
 you would not use it like that.
 
 You can also use |lprun_all|, which profiles the whole cell you're
 executing automagically, without needing to specify lines/functions
-yourself.  It's meant for easier use for beginners.
+yourself. It's meant for easier use for beginners.
 
 For IPython 0.11+, you can install it by editing the IPython configuration file
 ``~/.ipython/profile_default/ipython_config.py`` to add the ``'line_profiler'``
@@ -318,7 +318,7 @@ class LineProfilerMagics(Magics):
     @classmethod
     def _lprun_all_get_rewritten_profiled_code(cls, tmpfile):
         # type: (str) -> types.CodeType
-        """ Transform and compile the AST of the profiled code.  This is
+        """ Transform and compile the AST of the profiled code. This is
         similar to :py:meth:`.LineProfiler.runctx`,
         """
         at = AstTreeProfiler(tmpfile, [tmpfile], profile_imports=False)
@@ -365,18 +365,18 @@ class LineProfilerMagics(Magics):
             %lprun [<options>] <statement>
 
         The given statement (which doesn't require quote marks) is run
-        via the :py:class:`~.LineProfiler`.  Profiling is enabled for
-        the functions specified by the ``-f`` options.  The statistics
+        via the :py:class:`~.LineProfiler`. Profiling is enabled for
+        the functions specified by the ``-f`` options. The statistics
         will be shown side-by-side with the code through the pager once
         the statement has completed.
 
         Options:
 
         ``-f <function>``: :py:class:`~.LineProfiler` only profiles
-        functions and methods it is told to profile.  This option tells
-        the profiler about these functions.  Multiple ``-f`` options may
-        be used.  The argument may be any expression that gives
-        a Python function or method object.  However, one must be
+        functions and methods it is told to profile. This option tells
+        the profiler about these functions. Multiple ``-f`` options may
+        be used. The argument may be any expression that gives
+        a Python function or method object. However, one must be
         careful to avoid spaces that may confuse the option parser.
 
         ``-m <module>``: Get all the functions/methods in a module
@@ -385,7 +385,7 @@ class LineProfilerMagics(Magics):
         useful results.
 
         ``-D <filename>``: dump the raw statistics out to a pickle file
-        on disk.  The usual extension for this is ``.lprof``.  These
+        on disk. The usual extension for this is ``.lprof``. These
         statistics may be viewed later by running
         ``python -m line_profiler``.
 
@@ -396,7 +396,7 @@ class LineProfilerMagics(Magics):
         has completed profiling.
 
         ``-s``: strip out all entries from the print-out that have
-        zeros.  This is an old alias for ``-z``.
+        zeros. This is an old, soon-to-be-deprecated alias for ``-z``.
 
         ``-z``: strip out all entries from the print-out that have
         zeros.
@@ -451,14 +451,14 @@ class LineProfilerMagics(Magics):
             %%lprun_all [<options>]
 
         By default, without the ``-p`` option, it includes nested
-        functions in the profiler.  The statistics will be shown
+        functions in the profiler. The statistics will be shown
         side-by-side with the code through the pager once the statement
         has completed.
 
         Options:
 
         ``-D <filename>``: dump the raw statistics out to a pickle file
-        on disk.  The usual extension for this is ``.lprof``.  These
+        on disk. The usual extension for this is ``.lprof``. These
         statistics may be viewed later by running
         ``python -m line_profiler``.
 
@@ -469,15 +469,15 @@ class LineProfilerMagics(Magics):
         has completed profiling.
 
         ``-z``: strip out all entries from the print-out that have
-        zeros.
+        zeros. This is included for consistency with the CLI.
 
         ``-u``: specify time unit for the print-out in seconds.
 
         ``-t``: store the total time taken (in seconds) to a variable
-        called ``_total_time_taken`` in your notebook.  This can be
+        called ``_total_time_taken`` in your notebook. This can be
         useful if you want to plot the total time taken for different
         versions of a code cell without needing to manually look at and
-        type down the time taken.  This can be accomplished with ``-r``,
+        type down the time taken. This can be accomplished with ``-r``,
         but that would require a decent bit of boilerplate code and some
         knowledge of the timings data structure, so this is added to be
         beginner-friendly.
