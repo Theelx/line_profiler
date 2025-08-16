@@ -28,7 +28,7 @@ help mechanism::
 
     In [1]: %lprun?
 
-.. |lprun| replace:: :py:data:`%%lprun <LineProfilerMagics.lprun>`
+.. |lprun| replace:: :py:data:`%lprun <LineProfilerMagics.lprun>`
 .. |lprun_all| replace:: :py:data:`%%lprun_all <LineProfilerMagics.lprun_all>`
 .. |builtins| replace:: :py:mod:`__builtins__ <builtins>`
 """
