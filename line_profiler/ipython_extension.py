@@ -36,6 +36,7 @@ help mechanism::
 import ast
 import builtins
 import functools
+import inspect
 import os
 import tempfile
 import textwrap
@@ -54,9 +55,11 @@ if TYPE_CHECKING:  # pragma: no cover
     DefNode = TypeVar('DefNode', ast.FunctionDef, ast.AsyncFunctionDef)
 
 from io import StringIO
+from itertools import product
 
 from IPython.core.getipython import get_ipython
 from IPython.core.magic import Magics, magics_class, line_magic, cell_magic
+from IPython.core.magic_arguments import (argument, magic_arguments, parse_argstring)
 from IPython.core.page import page
 from IPython.utils.ipstruct import Struct
 from IPython.core.error import UsageError
@@ -653,6 +656,166 @@ class LineProfilerMagics(Magics):
                 globals=global_ns, locals=local_ns)
 
         return self._handle_end(profile, run)
+
+
+    @magic_arguments()
+    @argument('-r', '--repeats', type=int, default=1,
+              help='Number of times to run the function under the profiler.')
+    @argument('--grid', type=str, default=None,
+              help='Name or expression of a dict[str, list[int|float]] to sweep, '
+                   'e.g. {"a":[10,100,1000]} or param_grid')
+    @argument('call', nargs='*',
+              help='Function call expression, e.g. my_func(1000, x=2)')
+    @line_magic
+    def lprun_n(self, line):
+        args = parse_argstring(self.lprun_n, line)
+        call_str = ' '.join(args.call)
+        if not call_str:
+            raise ValueError("Provide a function call, e.g. %lprun_n -r 3 my_func(1000)")
+
+        node = ast.parse(call_str, mode='eval').body
+        if not isinstance(node, ast.Call):
+            raise ValueError("Argument must be a function call expression like: my_func(1000)")
+
+        user_ns = self.shell.user_ns
+
+        def eval_expr(expr_node):
+            code = compile(ast.Expression(expr_node), "<lprun_n>", "eval")
+            return eval(code, user_ns, user_ns)
+
+        func_obj = eval_expr(node.func)
+        sig = inspect.signature(func_obj)
+
+        base_pos_args = [eval_expr(a) for a in node.args]
+        base_kwargs = {kw.arg: eval_expr(kw.value) for kw in node.keywords}
+
+        def build_kwargs_with_overrides(override_dict=None):
+            final = {}
+            for name, p in sig.parameters.items():
+                if p.default is not inspect._empty:
+                    final[name] = p.default
+            bound = sig.bind_partial(*base_pos_args, **base_kwargs)
+            bound.apply_defaults()
+            # map positional → names
+            for (name, _p), val in zip(sig.parameters.items(), bound.args):
+                final[name] = val
+            final.update(bound.kwargs)
+            if override_dict:
+                for k, v in override_dict.items():
+                    if k not in sig.parameters:
+                        raise ValueError(f"Unknown parameter in grid: {k}")
+                    final[k] = v
+            return final
+
+        def profile_kwargs_only(func, kw_args, repeats):
+            lp = LineProfiler()
+            wrapped = lp(func)
+            res = None
+            for _ in range(repeats):
+                res = wrapped(**kw_args)  # kwargs-only call
+            stats = lp.get_stats()
+            unit = stats.unit
+            total_ticks = 0
+            for (_fname, _first_lineno, func_name), line_list in stats.timings.items():
+                if func_name == func.__name__:
+                    total_ticks += sum(ticks for (_lineno, _hits, ticks) in line_list)
+            return res, total_ticks * unit
+
+        # Single-call mode
+        if not args.grid:
+            kw = build_kwargs_with_overrides()
+            return profile_kwargs_only(func_obj, kw, args.repeats)
+
+        # Grid mode
+        try:
+            try:
+                param_grid = user_ns[args.grid]
+            except KeyError:
+                param_grid = eval(compile(ast.parse(args.grid, mode='eval'),
+                                          "<lprun_n_grid>", "eval"),
+                                  user_ns, user_ns)
+        except Exception as e:
+            raise ValueError(f"Could not evaluate --grid expression '{args.grid}': {e}")
+
+        if not isinstance(param_grid, dict) or not param_grid:
+            raise ValueError("--grid must be a non-empty dict[str, list[int|float]]")
+
+        for k, v in param_grid.items():
+            if not isinstance(k, str):
+                raise ValueError(f"Grid key '{k}' must be a string")
+            if not isinstance(v, (list, tuple)) or not v:
+                raise ValueError(f"Grid values for '{k}' must be a non-empty list/tuple")
+            for x in v:
+                if not isinstance(x, (int, float)):
+                    raise ValueError(f"Grid values for '{k}' must be int/float; got {type(x).__name__}")
+
+        keys = list(param_grid.keys())
+        combos = list(product(*[param_grid[k] for k in keys]))
+
+        # Helpers to make identically-keyed dicts for single vs multi param grids
+        def make_key_and_containers():
+            if len(keys) == 1:
+                pname = keys[0]
+                return ("single", pname, {pname: {}}, {pname: {}})
+            else:
+                return ("multi", None, {}, {})
+
+        mode, single_name, results_container, times_container = make_key_and_containers()
+
+        # We don’t know the function’s tuple arity until first run; detect then
+        results_dicts = None  # will become a list of dicts (one per tuple element)
+
+        for combo in combos:
+            overrides = {k: v for k, v in zip(keys, combo)}
+            kw = build_kwargs_with_overrides(overrides)
+            res, secs = profile_kwargs_only(func_obj, kw, args.repeats)
+
+            # Prepare key and destination dict(s)
+            if mode == "single":
+                (val,) = combo
+                dest_key = (single_name, val)  # nested under results_container[single_name][val]
+            else:
+                label = ",".join(f"{k}={v}" for k, v in overrides.items())
+                dest_key = label
+
+            # Initialize per-position result dicts on first observation
+            if results_dicts is None:
+                if isinstance(res, tuple):
+                    m = len(res)
+                    # Build m dicts mirroring times_container’s structure
+                    if mode == "single":
+                        results_dicts = [{single_name: {}} for _ in range(m)]
+                    else:
+                        results_dicts = [{} for _ in range(m)]
+                else:
+                    # Non-tuple results: still support, treat as 1 “column”
+                    if mode == "single":
+                        results_dicts = [{single_name: {}}]
+                    else:
+                        results_dicts = [{}]
+
+            # Store results per position
+            if isinstance(res, tuple):
+                for i, ri in enumerate(res):
+                    if mode == "single":
+                        results_dicts[i][single_name][combo[0]] = ri
+                    else:
+                        results_dicts[i][dest_key] = ri
+            else:
+                if mode == "single":
+                    results_dicts[0][single_name][combo[0]] = res
+                else:
+                    results_dicts[0][dest_key] = res
+
+            # Store time
+            if mode == "single":
+                times_container[single_name][combo[0]] = secs
+            else:
+                times_container[dest_key] = secs
+
+        # Return (<tuple-of-result-dicts>, times_dict)
+        return tuple(results_dicts), times_container
+
 
     @cell_magic
     def lprun_all(self, parameter_s="", cell=""):
