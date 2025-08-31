@@ -42,8 +42,11 @@ import tempfile
 import textwrap
 import time
 import types
+from collections import OrderedDict
 from contextlib import ExitStack
 from dataclasses import dataclass
+from io import StringIO
+from itertools import product
 from pathlib import Path
 from typing import TYPE_CHECKING, Union
 if TYPE_CHECKING:  # pragma: no cover
@@ -53,9 +56,6 @@ if TYPE_CHECKING:  # pragma: no cover
     PS = ParamSpec('PS')
     PD = TypeVar('PD', bound='_PatchDict')
     DefNode = TypeVar('DefNode', ast.FunctionDef, ast.AsyncFunctionDef)
-
-from io import StringIO
-from itertools import product
 
 from IPython.core.getipython import get_ipython
 from IPython.core.magic import Magics, magics_class, line_magic, cell_magic
@@ -492,6 +492,189 @@ class _PatchDict:
         return cls(vars(module), **kwargs)
 
 
+class ParamCube:
+    """
+    Order-agnostic, multi-dimensional associative cube for parameter sweeps.
+
+    - _dims: list[str] - dimension names (logical order; can be pivoted)
+    - _data: dict[tuple(values aligned with _dims) -> scalar]
+    - _values: dict[str, list[Any]] - allowed values per dimension (keeps declared order)
+    """
+
+    __slots__ = ("_dims", "_data", "_values")
+
+    def __init__(self, dims, data, values_per_dim):
+        self._dims = list(dims)
+        self._data = data  # mapping from tuple aligned with self._dims -> scalar
+        self._values = {k: list(v) for k, v in values_per_dim.items()}
+
+    def _with(self, dims=None, data=None, values_per_dim=None):
+        return ParamCube(
+            dims if dims is not None else self._dims,
+            data if data is not None else self._data,
+            values_per_dim if values_per_dim is not None else self._values,
+        )
+
+    def _reorder(self, first_dim):
+        """Return a view with `first_dim` moved to front (no data copy)."""
+        if first_dim not in self._dims:
+            raise KeyError(f"Unknown dimension: {first_dim}")
+        if self._dims and self._dims[0] == first_dim:
+            return self
+        new_dims = [first_dim] + [d for d in self._dims if d != first_dim]
+        idx_map = [self._dims.index(d) for d in new_dims]
+        new_data = {}
+        for tup, val in self._data.items():
+            new_tup = tuple(tup[i] for i in idx_map)
+            new_data[new_tup] = val
+        return ParamCube(new_dims, new_data, self._values)
+
+    def _dict_from_1d(self):
+        """Materialize current 1D cube as {value: scalar} respecting order."""
+        if len(self._dims) != 1:
+            raise KeyError("Internal: not a 1D cube")
+        dim = self._dims[0]
+        out = {}
+        for v in self._values[dim]:
+            # pull scalar corresponding to (v,)
+            sub = {}
+            for t, scalar in self._data.items():
+                if t and t[0] == v:
+                    sub[t[1:]] = scalar
+            out[v] = sub[()]  # scalar
+        return out
+
+    def _filter_first_dim(self, allowed_values):
+        """Filter along the first dimension to allowed_values (preserving order)."""
+        if not self._dims:
+            raise KeyError("No dimensions left to filter")
+        first = self._dims[0]
+        allowed_set = set(allowed_values)
+        new_values = [v for v in self._values[first] if v in allowed_set]
+        new_data = {t: val for t, val in self._data.items() if t and t[0] in allowed_set}
+        new_values_per_dim = dict(self._values)
+        new_values_per_dim[first] = new_values
+        return ParamCube(self._dims, new_data, new_values_per_dim)
+
+    def _select_first_value(self, value):
+        """
+        Select a single value along the first dimension.
+        Returns:
+          - scalar if no dims remain
+          - dict {remaining_value: scalar} if exactly 1 dim remains
+          - ParamCube otherwise
+        """
+        if not self._dims:
+            if () in self._data:
+                return self._data[()]
+            raise KeyError("No data")
+        first = self._dims[0]
+        if value not in self._values[first]:
+            raise KeyError(f"Value {value!r} not in dimension {first!r}")
+
+        new_dims = self._dims[1:]
+        new_data = {}
+        for t, val in self._data.items():
+            if t and t[0] == value:
+                new_data[t[1:]] = val
+
+        new_values_per_dim = {d: self._values[d] for d in new_dims}
+
+        if not new_dims:
+            return new_data[()]
+        elif len(new_dims) == 1:
+            dim = new_dims[0]
+            out = {}
+            for v in new_values_per_dim[dim]:
+                sub = {}
+                for t, scalar in new_data.items():
+                    if t and t[0] == v:
+                        sub[t[1:]] = scalar
+                out[v] = sub[()]
+            return out
+        else:
+            return ParamCube(new_dims, new_data, new_values_per_dim)
+
+    def __getitem__(self, key):
+        """
+        - str:
+            * if it's a dimension name -> pivot to make that dimension first;
+              if that leaves a 1D cube, return {value: scalar}
+            * else, if it's a value in the FIRST dimension -> select that value
+        - list/tuple/set -> select subset along FIRST dimension (preserve order)
+        - other scalars -> select a single value along FIRST dimension,
+                          returning dict if 1D or scalar if 0D
+        """
+        if isinstance(key, str):
+            if key in self._dims:  # pivot by dimension name
+                cube = self._reorder(key)
+                if len(cube._dims) == 1:
+                    return cube._dict_from_1d()
+                return cube
+            # treat as value in the first dimension (after any pivot)
+            if self._dims and key in self._values[self._dims[0]]:
+                return self._select_first_value(key)
+            raise KeyError(f"Unknown dimension/value: {key!r}")
+
+        if isinstance(key, (list, tuple, set)):
+            return self._filter_first_dim(key)
+
+        return self._select_first_value(key)
+
+    # dot-indexing:
+    # - if attribute matches a dimension name, pivot (and auto-dict if 1D)
+    # - else, if attribute matches a VALUE in the FIRST dimension, select it
+    def __getattr__(self, name):
+        if name in {"_dims", "_data", "_values"}:
+            raise AttributeError(name)
+        if name in self._dims:
+            cube = self._reorder(name)
+            if len(cube._dims) == 1:
+                return cube._dict_from_1d()
+            return cube
+        if self._dims and name in self._values[self._dims[0]]:
+            return self._select_first_value(name)
+        raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
+
+    def dims(self):
+        """Tuple of dimension names in current order."""
+        return tuple(self._dims)
+
+    def values(self, dim_name):
+        """Tuple of allowed labels for a dimension (not timings)."""
+        return tuple(self._values[dim_name])
+
+    def to_dict(self):
+        """Materialize as nested dicts in current dimension order."""
+        def build(dims, data):
+            if not dims:
+                return data[()]
+            first, *rest = dims
+            out = {}
+            for v in self._values[first]:
+                sub = {t[1:]: scalar for t, scalar in data.items() if t and t[0] == v}
+                if not rest:
+                    out[v] = sub[()]
+                else:
+                    out[v] = build(rest, sub)
+            return out
+        return build(self._dims, self._data)
+
+    def item(self):
+        """Return the scalar when fully selected (0D)."""
+        if self._dims:
+            raise ValueError("Cube is not a scalar; select all dimensions first.")
+        return self._data[()]
+
+    def __repr__(self):
+        shape = "×".join(str(len(self._values[d])) for d in self._dims) or "scalar"
+        return f"ParamCube(dims={self._dims}, shape={shape})"
+
+
+# Allowed primitive scalar types for grid values
+_PRIMITIVE_TYPES = (int, float, complex, str, bytes, bool)
+
+
 @magics_class
 class LineProfilerMagics(Magics):
     def _parse_parameters(self, parameter_s, getopt_spec, opts_def):
@@ -662,12 +845,36 @@ class LineProfilerMagics(Magics):
     @argument('-r', '--repeats', type=int, default=1,
               help='Number of times to run the function under the profiler.')
     @argument('--grid', type=str, default=None,
-              help='Name or expression of a dict[str, list[int|float]] to sweep, '
+              help='Name or expression of a dict[str,'
+                   'list[int|float|complex|str|bytes|bool]] to sweep, '
                    'e.g. {"a":[10,100,1000]} or param_grid')
     @argument('call', nargs='*',
               help='Function call expression, e.g. my_func(1000, x=2)')
     @line_magic
     def lprun_n(self, line):
+        """Execute the function under the line-by-line
+        profiler from the :py:mod:`line_profiler` module.
+
+        Usage::
+
+            (arg1, arg2), timings = %lprun_n [<options>] MyFunction()
+
+        The timings will be returned as an additional return value. That
+        is to say, if the function normally returns arg1 and arg2, you'd
+        access the timings through tuple deconstruction like in the
+        above usage.
+
+        Options:
+
+        ``-r <repeats=1>``: change the number of times the function is
+        run inside a loop, for averaging purposes.
+
+        ``--grid <filename>``: Do a grid search on the specified
+        arguments and values. The grid should be passed as a dictionary
+        mapping the argument name to a list or tuple of parameters that
+        it should try. An exhaustive grid search of all parameter
+        combinations is conducted.
+        """
         args = parse_argstring(self.lprun_n, line)
         call_str = ' '.join(args.call)
         if not call_str:
@@ -696,7 +903,6 @@ class LineProfilerMagics(Magics):
                     final[name] = p.default
             bound = sig.bind_partial(*base_pos_args, **base_kwargs)
             bound.apply_defaults()
-            # map positional → names
             for (name, _p), val in zip(sig.parameters.items(), bound.args):
                 final[name] = val
             final.update(bound.kwargs)
@@ -712,9 +918,9 @@ class LineProfilerMagics(Magics):
             wrapped = lp(func)
             res = None
             for _ in range(repeats):
-                res = wrapped(**kw_args)  # kwargs-only call
+                res = wrapped(**kw_args)  # kwargs-only call avoids multiple-values error
             stats = lp.get_stats()
-            unit = stats.unit
+            unit = stats.unit  # seconds per tick
             total_ticks = 0
             for (_fname, _first_lineno, func_name), line_list in stats.timings.items():
                 if func_name == func.__name__:
@@ -726,7 +932,7 @@ class LineProfilerMagics(Magics):
             kw = build_kwargs_with_overrides()
             return profile_kwargs_only(func_obj, kw, args.repeats)
 
-        # Grid mode
+        # Grid mode: evaluate and validate grid
         try:
             try:
                 param_grid = user_ns[args.grid]
@@ -738,83 +944,57 @@ class LineProfilerMagics(Magics):
             raise ValueError(f"Could not evaluate --grid expression '{args.grid}': {e}")
 
         if not isinstance(param_grid, dict) or not param_grid:
-            raise ValueError("--grid must be a non-empty dict[str, list[int|float]]")
+            raise ValueError("--grid must be a non-empty dict[str, list[primitive]]")
 
+        # Validate types and normalize to lists preserving order
+        values_per_dim = OrderedDict()
         for k, v in param_grid.items():
             if not isinstance(k, str):
                 raise ValueError(f"Grid key '{k}' must be a string")
             if not isinstance(v, (list, tuple)) or not v:
                 raise ValueError(f"Grid values for '{k}' must be a non-empty list/tuple")
             for x in v:
-                if not isinstance(x, (int, float)):
-                    raise ValueError(f"Grid values for '{k}' must be int/float; got {type(x).__name__}")
+                if not isinstance(x, _PRIMITIVE_TYPES):
+                    raise ValueError(
+                        f"Grid values for '{k}' must be one of {tuple(t.__name__ for t in _PRIMITIVE_TYPES)}; "
+                        f"got {type(x).__name__}"
+                    )
+            values_per_dim[k] = list(v)
 
-        keys = list(param_grid.keys())
-        combos = list(product(*[param_grid[k] for k in keys]))
+        dims = list(values_per_dim.keys())
+        combos = list(product(*[values_per_dim[k] for k in dims]))
 
-        # Helpers to make identically-keyed dicts for single vs multi param grids
-        def make_key_and_containers():
-            if len(keys) == 1:
-                pname = keys[0]
-                return ("single", pname, {pname: {}}, {pname: {}})
-            else:
-                return ("multi", None, {}, {})
+        # We will build dense maps keyed by tuple aligned with dims
+        times_data = {}
+        result_data_list = None  # one ParamCube per result component
 
-        mode, single_name, results_container, times_container = make_key_and_containers()
-
-        # We don’t know the function’s tuple arity until first run; detect then
-        results_dicts = None  # will become a list of dicts (one per tuple element)
-
+        # Sweep
         for combo in combos:
-            overrides = {k: v for k, v in zip(keys, combo)}
+            overrides = {k: v for k, v in zip(dims, combo)}
             kw = build_kwargs_with_overrides(overrides)
             res, secs = profile_kwargs_only(func_obj, kw, args.repeats)
 
-            # Prepare key and destination dict(s)
-            if mode == "single":
-                (val,) = combo
-                dest_key = (single_name, val)  # nested under results_container[single_name][val]
-            else:
-                label = ",".join(f"{k}={v}" for k, v in overrides.items())
-                dest_key = label
+            times_data[combo] = secs
 
-            # Initialize per-position result dicts on first observation
-            if results_dicts is None:
+            # Initialize result containers once we see the function's return
+            if result_data_list is None:
                 if isinstance(res, tuple):
                     m = len(res)
-                    # Build m dicts mirroring times_container’s structure
-                    if mode == "single":
-                        results_dicts = [{single_name: {}} for _ in range(m)]
-                    else:
-                        results_dicts = [{} for _ in range(m)]
+                    result_data_list = [dict() for _ in range(m)]
                 else:
-                    # Non-tuple results: still support, treat as 1 “column”
-                    if mode == "single":
-                        results_dicts = [{single_name: {}}]
-                    else:
-                        results_dicts = [{}]
+                    result_data_list = [dict()]  # single "column"
 
-            # Store results per position
             if isinstance(res, tuple):
                 for i, ri in enumerate(res):
-                    if mode == "single":
-                        results_dicts[i][single_name][combo[0]] = ri
-                    else:
-                        results_dicts[i][dest_key] = ri
+                    result_data_list[i][combo] = ri
             else:
-                if mode == "single":
-                    results_dicts[0][single_name][combo[0]] = res
-                else:
-                    results_dicts[0][dest_key] = res
+                result_data_list[0][combo] = res
 
-            # Store time
-            if mode == "single":
-                times_container[single_name][combo[0]] = secs
-            else:
-                times_container[dest_key] = secs
+        # Wrap into ParamCubes (order-agnostic, flexible indexing)
+        times_cube = ParamCube(dims, times_data, values_per_dim)
+        result_cubes = tuple(ParamCube(dims, dct, values_per_dim) for dct in result_data_list)
 
-        # Return (<tuple-of-result-dicts>, times_dict)
-        return tuple(results_dicts), times_container
+        return result_cubes, times_cube
 
 
     @cell_magic
