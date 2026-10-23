@@ -1,0 +1,6 @@
+.venvs/
+annotate/
+cython_bench/build/
+cython_bench/*.egg-info/
+cython_bench/lp_bench_cython/*.c
+cython_bench/lp_bench_cython/*.so

@@ -1,0 +1,7 @@
+[build-system]
+requires = ["setuptools", "Cython"]
+
+[project]
+name = 'lp_bench_cython'
+description = 'Cython code for benchmarking line_profiler (see bench/bench.py)'
+version = '0.0.0'
