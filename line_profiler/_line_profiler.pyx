@@ -172,6 +172,9 @@ cdef Py_ssize_t _BLOCK_INFO_EXTRA_INDEX = (
     PyUnstable_Eval_RequestCodeExtraIndex(free_block_info))
 if _BLOCK_INFO_EXTRA_INDEX < 0:
     PyErr_Clear()
+    warn('All the scratch slots on code objects (see PEP 523) are taken '
+         'by other extensions; line profiling still works, but with more '
+         'overhead')
 
 
 cdef inline void compute_block_info(object code, BlockInfo *info) noexcept:
@@ -209,7 +212,13 @@ cdef inline BlockInfo *get_block_info(
     cdef void *extra = NULL
     cdef BlockInfo *info
     if _BLOCK_INFO_EXTRA_INDEX >= 0:
-        PyUnstable_Code_GetExtra(code, _BLOCK_INFO_EXTRA_INDEX, &extra)
+        if PyUnstable_Code_GetExtra(
+                code, _BLOCK_INFO_EXTRA_INDEX, &extra) < 0:
+            # Only fails if code isn't a code object, which there's
+            # nothing to cache on
+            PyErr_Clear()
+            compute_block_info(code, scratch)
+            return scratch
         if extra != NULL:
             return <BlockInfo *>extra
         info = <BlockInfo *>malloc(sizeof(BlockInfo))
@@ -322,9 +331,9 @@ sys.monitoring.html#monitoring-event-RERAISE
     """
     cdef TraceCallback *legacy_callback
     cdef _SysMonitoringState mon_state
-    cdef public set active_instances  # type: set[LineProfiler]
-    # Mirrors .active_instances (holding references of its own) for
-    # the trace callbacks, which can iterate over it more cheaply
+    # The active LineProfiler instances, holding references of their
+    # own; a vector because the trace callbacks iterate over it, which
+    # is cheaper than over a set
     cdef vector[PyObject *] _active
     cdef int _wrap_trace
     cdef int _set_frame_local_trace
@@ -350,29 +359,43 @@ sys.monitoring.html#monitoring-event-RERAISE
         self.legacy_callback = NULL
         self.mon_state = _SysMonitoringState(tool_id)
 
-        self.active_instances = set()
         self.wrap_trace = wrap_trace
         self.set_frame_local_trace = set_frame_local_trace
         self.recursion_guard = 0
 
     def __dealloc__(self):
-        self._clear_active()
-
-    cdef void _clear_active(self) noexcept:
         cdef PyObject *prof
         for prof in self._active:
             Py_XDECREF(prof)
         self._active.clear()
 
-    cdef void _sync_active(self) noexcept:
+    property active_instances:
+        def __get__(self):
+            # type: () -> set[LineProfiler]
+            return {<object>prof for prof in self._active}
+
+    cdef bint _add_active(self, object prof) noexcept:
         """
-        Update self._active to match
-        self.active_instances.
+        Returns:
+            Whether ``prof`` wasn't already active
         """
-        self._clear_active()
-        for prof in self.active_instances:
-            Py_INCREF(<PyObject *>prof)
-            self._active.push_back(<PyObject *>prof)
+        cdef PyObject *prof_ = <PyObject *>prof
+        cdef PyObject *active
+        for active in self._active:
+            if active == prof_:
+                return False
+        Py_INCREF(prof_)
+        self._active.push_back(prof_)
+        return True
+
+    cdef void _remove_active(self, object prof) noexcept:
+        cdef PyObject *prof_ = <PyObject *>prof
+        cdef size_t i
+        for i in range(self._active.size()):
+            if self._active[i] == prof_:
+                self._active.erase(self._active.begin() + i)
+                Py_XDECREF(prof_)
+                return
 
     @cython.profile(False)
     def __call__(self, frame: types.FrameType, event: str, arg):
@@ -464,18 +487,15 @@ line_profiler/blob/main/line_profiler/_line_profiler.pyx
         Line-event callback for :py:attr:`!sys.monitoring.events.LINE`,
         passed to :py:func:`sys.monitoring.register_callback`.
         """
-        if inner_trace_callback(1, &self._active, code, lineno, NULL):
-            if self._wrap_trace:
-                self.mon_state.call_callback(
-                    _LINE_EVENT, code, (lineno,), ())
-            return
+        cdef bint profiled = inner_trace_callback(
+            1, &self._active, code, lineno, NULL)
         if self._wrap_trace:
             self.mon_state.call_callback(_LINE_EVENT, code, (lineno,), ())
-            return
-        # Not being profiled: stop the event from firing here at all
-        # (unless the wrapped callbacks still need it)
-        note_events_disabled()
-        return _DISABLE
+        elif not profiled:
+            # Not being profiled and no wrapped callbacks need the
+            # event: stop it from firing here at all
+            note_events_disabled()
+            return _DISABLE
 
     @cython.profile(False)
     @cython.binding(False)
@@ -549,14 +569,13 @@ line_profiler/blob/main/line_profiler/_line_profiler.pyx
 
     cpdef _handle_enable_event(self, prof):
         cdef TraceCallback* legacy_callback
-        instances = self.active_instances
-        already_active = bool(instances)
-        if not USE_LEGACY_TRACE and prof not in instances:
+        cdef bint already_active = not self._active.empty()
+        if not self._add_active(prof):
+            return
+        if not USE_LEGACY_TRACE:
             # The code profiled by prof may have had its events
             # disabled while it wasn't being profiled
             restart_disabled_events()
-        instances.add(prof)
-        self._sync_active()
         if already_active:
             return
         if USE_LEGACY_TRACE:
@@ -573,10 +592,8 @@ line_profiler/blob/main/line_profiler/_line_profiler.pyx
 
     cpdef _handle_disable_event(self, prof):
         cdef TraceCallback* legacy_callback
-        instances = self.active_instances
-        instances.discard(prof)
-        self._sync_active()
-        if instances:
+        self._remove_active(prof)
+        if not self._active.empty():
             return
         # Only use the legacy trace-callback system if Python < 3.12 or
         # if explicitly requested with `LINE_PROFILER_CORE=legacy`;

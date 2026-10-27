@@ -201,6 +201,8 @@ cdef class _LineProfilerBase:
         that the extension modules can be compiled in parallel; the
         trace callbacks there access the C-level data directly.
     """
+    # Note: unlike the (C-level) instance attributes, this can't be
+    # declared in the .pxd, which only takes C-level declarations
     # type: ClassVar[dict[bytes, int]], bytes = bytecode
     _all_paddings = {}
 

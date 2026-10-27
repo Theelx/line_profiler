@@ -427,16 +427,25 @@ def test_abandoned_generator_and_coroutine_timing(tracing_core):
     assert get_tagged_line_stats(prof, gen)[0]['gen: unreached'][0] == 0
 
 
-def test_time_between_calls_not_recorded():
+@pytest.mark.parametrize('exit_via', ['return', 'raise', 'propagate'])
+def test_time_between_calls_not_recorded(tracing_core, exit_via):
     """
     Test that the time spent between calls to a profiled function isn't
-    attributed to its lines (i.e. that its return events are always
-    handled).
+    attributed to its lines (i.e. that the events of its frame exiting
+    are always handled), whether it returns, raises, or lets an
+    exception from a callee propagate.
     """
     prof = LineProfiler()
     delay = .02
 
+    def fail():
+        raise ValueError
+
     def func():
+        if exit_via == 'raise':
+            raise ValueError
+        if exit_via == 'propagate':
+            fail()
         return 1
 
     prof.add_function(func)
@@ -444,12 +453,65 @@ def test_time_between_calls_not_recorded():
     # clear the timing records) after each call
     with prof:
         for _ in range(4):
-            func()
+            try:
+                func()
+            except ValueError:
+                pass
             time.sleep(delay)
     stats = prof.get_stats()
     (timings,) = stats.timings.values()
-    assert sum(nhits for _, nhits, _ in timings) == 4
+    # Each line run is hit once per call
+    assert {nhits for _, nhits, _ in timings} == {4}
     assert sum(t for _, _, t in timings) * stats.unit < delay
+
+
+def test_code_extra_slots_exhausted(tracing_core):
+    """
+    Test that profiling still works (with a warning) when all the
+    scratch slots on code objects (see PEP 523), on which the trace
+    callbacks cache information about the code, have been taken by other
+    extensions before line_profiler is imported.
+    """
+    script = textwrap.dedent('''
+    import ctypes
+    import warnings
+
+    api = ctypes.pythonapi
+    try:  # Python 3.12+
+        request_index = api.PyUnstable_Eval_RequestCodeExtraIndex
+    except AttributeError:
+        request_index = api._PyEval_RequestCodeExtraIndex
+    request_index.argtypes = [ctypes.c_void_p]
+    request_index.restype = ctypes.c_ssize_t
+    while request_index(None) >= 0:
+        pass
+
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter('always')
+        from line_profiler import LineProfiler
+    assert any('scratch slots' in str(w.message) for w in record), record
+
+    def func(n):
+        total = 0
+        for i in range(n):
+            total += i
+        return total
+
+    prof = LineProfiler(func)
+    with prof:
+        assert func(10) == 45
+    (timings,) = prof.get_stats().timings.values()
+    assert {lineno: nhits for lineno, nhits, _ in timings} == {
+        func.__code__.co_firstlineno + 1: 1,
+        func.__code__.co_firstlineno + 2: 11,
+        func.__code__.co_firstlineno + 3: 10,
+        func.__code__.co_firstlineno + 4: 1,
+    }, timings
+    ''')
+    env = {**os.environ, 'LINE_PROFILER_CORE': tracing_core}
+    proc = subprocess.run([sys.executable, '-c', script], env=env,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_enable_disable():
@@ -1143,105 +1205,6 @@ def test_sys_monitoring(monkeypatch):
     assert tool is None, (
         f'Expected no active profiling tool after profiling, got {tool!r}'
     )
-
-
-@pytest.mark.skipif(
-    not hasattr(sys, 'monitoring'),
-    reason='no sys.monitoring in version '
-    f'{".".join(str(v) for v in sys.version_info[:2])}',
-)
-def test_sys_monitoring_disabled_events_restored_after_use(monkeypatch):
-    """
-    Test that the sys.monitoring events which the profiler disabled at
-    the locations it didn't profile are re-enabled when it's done, so
-    that a tool using the same tool ID afterwards receives them
-    (freeing the tool ID doesn't reset them).
-    """
-    monkeypatch.setattr(_line_profiler, 'USE_LEGACY_TRACE', False)
-    mon = sys.monitoring
-    tool_id = mon.PROFILER_ID
-    lines = []
-
-    def unprofiled():
-        x = 1
-        return x
-
-    def profiled():
-        return unprofiled()
-
-    def on_line(code, lineno):
-        if code is unprofiled.__code__:
-            lines.append(lineno)
-
-    prof = LineProfiler(wrap_trace=False)
-    prof.add_function(profiled)
-    assert mon.get_tool(tool_id) is None
-    with prof:
-        # The events in unprofiled() are disabled here
-        profiled()
-    assert mon.get_tool(tool_id) is None
-
-    # Another tool using the same tool ID
-    mon.use_tool_id(tool_id, 'other_tool')
-    try:
-        mon.register_callback(tool_id, mon.events.LINE, on_line)
-        mon.set_events(tool_id, mon.events.LINE)
-        unprofiled()
-    finally:
-        mon.set_events(tool_id, mon.events.NO_EVENTS)
-        mon.register_callback(tool_id, mon.events.LINE, None)
-        mon.free_tool_id(tool_id)
-    assert lines
-
-
-@pytest.mark.skipif(
-    not hasattr(sys, 'monitoring'),
-    reason='no sys.monitoring in version '
-    f'{".".join(str(v) for v in sys.version_info[:2])}',
-)
-def test_sys_monitoring_wrap_trace_turned_on(monkeypatch):
-    """
-    Test that turning on wrap_trace while profiling re-enables the
-    sys.monitoring events which the profiler disabled while it wasn't
-    wrapping, so that the wrapped callbacks receive them.
-    """
-    monkeypatch.setattr(_line_profiler, 'USE_LEGACY_TRACE', False)
-    mon = sys.monitoring
-    tool_id = mon.PROFILER_ID
-    lines = []
-
-    def unprofiled():
-        x = 1
-        return x
-
-    def profiled():
-        return 1
-
-    def on_line(code, lineno):
-        if code is unprofiled.__code__:
-            lines.append(lineno)
-
-    prof = LineProfiler(wrap_trace=False)
-    prof.add_function(profiled)
-    # Another tool already using the tool ID
-    assert mon.get_tool(tool_id) is None
-    mon.use_tool_id(tool_id, 'other_tool')
-    try:
-        mon.register_callback(tool_id, mon.events.LINE, on_line)
-        mon.set_events(tool_id, mon.events.LINE)
-        with prof:
-            # Not wrapping, so the other tool doesn't receive the events,
-            # which are disabled in unprofiled()
-            unprofiled()
-            assert not lines
-            prof.wrap_trace = True
-            unprofiled()
-        assert lines
-    finally:
-        prof.wrap_trace = False
-        mon.set_events(tool_id, mon.events.NO_EVENTS)
-        mon.register_callback(tool_id, mon.events.LINE, None)
-        mon.free_tool_id(tool_id)
 
 
 def test_profile_generated_code():

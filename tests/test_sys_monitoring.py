@@ -1035,3 +1035,73 @@ def test_disabled_events_restored_for_other_tools() -> None:
     finally:
         MON.set_events(events)
         MON.register_callback(MON.PY_RETURN, old_callback)
+
+
+def test_disabled_events_restored_after_tool_id_reuse() -> None:
+    """
+    Check that another tool which acquires the tool ID after we've
+    released it gets the events we disabled while profiling (since
+    freeing the tool ID doesn't reset them).
+    """
+    inner, outer = _make_nested_funcs()
+    lines: Counter = Counter()
+
+    def on_line(code: CodeType, lineno: int) -> None:
+        lines[code] += 1
+
+    # Have LineProfiler acquire the tool ID itself
+    tool_name = MON.get_tool()
+    MON.free_tool_id()
+    try:
+        prof = LineProfiler(wrap_trace=False)
+        prof.add_function(outer)
+        with prof:
+            # The line events of inner() are disabled here
+            assert outer(10) == 45
+        assert MON.get_tool() is None
+        MON.use_tool_id('other_tool')
+        old_callback = MON.register_callback(MON.LINE, on_line)
+        try:
+            MON.set_events(MON.LINE)
+            assert inner(10) == 45
+        finally:
+            MON.set_events(MON.NO_EVENTS)
+            MON.register_callback(MON.LINE, old_callback)
+        assert lines[inner.__code__]
+    finally:
+        if MON.get_tool() is not None:
+            MON.free_tool_id()
+        if tool_name is not None:
+            MON.use_tool_id(tool_name)
+
+
+def test_disabled_events_restarted_on_wrap_trace() -> None:
+    """
+    Check that turning on ``wrap_trace`` while profiling re-enables the
+    events which were disabled while not wrapping, so that the wrapped
+    callbacks receive them.
+    """
+    inner, outer = _make_nested_funcs()
+    lines: Counter = Counter()
+
+    def on_line(code: CodeType, lineno: int) -> None:
+        lines[code] += 1
+
+    events = MON.get_events()
+    old_callback = MON.register_callback(MON.LINE, on_line)
+    MON.set_events(events | MON.LINE)
+    prof = LineProfiler(wrap_trace=False)
+    prof.add_function(outer)
+    try:
+        with prof:
+            # Not wrapping, so the callback doesn't receive the events,
+            # which are disabled in inner()
+            assert inner(10) == 45
+            assert not lines[inner.__code__]
+            prof.wrap_trace = True
+            assert inner(10) == 45
+        assert lines[inner.__code__]
+    finally:
+        prof.wrap_trace = False
+        MON.set_events(events)
+        MON.register_callback(MON.LINE, old_callback)
