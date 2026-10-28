@@ -472,6 +472,11 @@ def test_code_extra_slots_exhausted(tracing_core):
     callbacks cache information about the code, have been taken by other
     extensions before line_profiler is imported.
     """
+    # The subprocess uses the same interpreter, so check here whether it
+    # can take the slots via the C API
+    ctypes = pytest.importorskip('ctypes')
+    if ctypes.pythonapi is None:
+        pytest.skip('ctypes.pythonapi unavailable')
     script = textwrap.dedent('''
     import ctypes
     import warnings

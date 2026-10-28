@@ -371,8 +371,9 @@ sys.monitoring.html#monitoring-event-RERAISE
 
     property active_instances:
         def __get__(self):
-            # type: () -> set[LineProfiler]
-            return {<object>prof for prof in self._active}
+            # type: () -> frozenset[LineProfiler]
+            # (A frozenset since changing it wouldn't do anything)
+            return frozenset([<object>prof for prof in self._active])
 
     cdef bint _add_active(self, object prof) noexcept:
         """
