@@ -1915,6 +1915,63 @@ def test_enable_profiler_during_execution(tracing_core):
     assert line_stats['after'][0] == 1
 
 
+def test_restore_only_actively_profiled_frames(monkeypatch):
+    """
+    Test that, with the legacy trace system, adding a function to a
+    profiler or enabling one only turns the line events back on in the
+    running frames whose code is profiled by a profiler active on their
+    thread, and not in those whose code is only profiled by inactive
+    profilers or by profilers active on other threads.
+    """
+    import threading
+
+    monkeypatch.setattr(_line_profiler, 'USE_LEGACY_TRACE', True)
+
+    def unrelated():
+        pass
+
+    def other():
+        pass
+
+    prof_a = LineProfiler(unrelated)
+    prof_b = LineProfiler()
+    prof_c = LineProfiler()
+    trace_lines = {}
+
+    def enable_c():
+        with prof_c:
+            pass
+
+    def worker():
+        frame = sys._getframe()
+        trace_lines['started'] = frame.f_trace_lines
+        # Adding a function to the active profiler
+        prof_a.add_function(other)
+        trace_lines['added'] = frame.f_trace_lines
+        # Enabling a profiler of worker() on another thread
+        thread = threading.Thread(target=enable_c)
+        thread.start()
+        thread.join()
+        trace_lines['other thread'] = frame.f_trace_lines
+        # Enabling a profiler of worker() on this thread
+        prof_b.enable_by_count()
+        trace_lines['enabled'] = frame.f_trace_lines
+        x = 1  # after
+        prof_b.disable_by_count()
+        return x
+
+    prof_b.add_function(worker)
+    prof_c.add_function(worker)
+    with prof_a:
+        assert worker() == 1
+    assert trace_lines == {
+        'started': False, 'added': False, 'other thread': False,
+        'enabled': True}
+    line_stats, _ = get_tagged_line_stats(prof_b, worker)
+    assert line_stats['after'][0] == 1
+    assert _total_hits(prof_c, worker) == 0
+
+
 def test_profilers_sharing_code(tracing_core):
     """
     Test that profilers profiling the same function record its calls

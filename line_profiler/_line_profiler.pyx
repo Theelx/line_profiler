@@ -274,25 +274,35 @@ cdef bint _frame_lines_disabled = False
 cdef restore_line_events():
     """
     With the legacy trace system, turn the line events back on for the
-    frames currently running (on all threads) whose code is now profiled,
-    but whose line events :c:func:`legacy_trace_callback` turned off
-    because it wasn't when they started (e.g. because a function was added
-    to a profiler, or a profiler was enabled, in the meantime).
+    frames currently running (on all threads) whose code is now profiled
+    by an active profiler on their thread, but whose line events
+    :c:func:`legacy_trace_callback` turned off because it wasn't when they
+    started (e.g. because a function was added to a profiler, or a
+    profiler was enabled, in the meantime).
 
     Note:
         Suspended generators and coroutines are dealt with when they are
         resumed (see :c:func:`legacy_trace_callback`).
     """
+    cdef _LineProfilerManager manager
     if not (USE_LEGACY_TRACE and _frame_lines_disabled):
         return
-    for frame in sys._current_frames().values():
+    managers = LineProfiler._managers
+    for thread_id, frame in sys._current_frames().items():
+        # Only the profilers active on the frames' thread record their
+        # line events (and the frames of a thread without any don't
+        # generate any)
+        manager = managers.get(thread_id)
+        if manager is None or manager._active.empty():
+            continue
         while frame is not None:
             if (not frame.f_trace_lines
-                    and get_block(frame.f_code) != NULL):
-                f_trace = frame.f_trace
-                if (f_trace is None
-                        or isinstance(f_trace, _LineProfilerManager)):
-                    frame.f_trace_lines = True
+                    and is_profiled(get_block(frame.f_code),
+                                    &manager._active)):
+                # (Unless it has another frame-local trace function,
+                # which may have turned them off itself)
+                c_enable_line_events(<PyFrameObject *>frame,
+                                     <PyObject *>manager)
             frame = frame.f_back
 
 
