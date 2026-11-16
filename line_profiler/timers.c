@@ -102,6 +102,28 @@ hpTimerUnit(void)
 
 #ifdef LINE_PROFILER_HAVE_TSC
 /*
+ * The CPUID leaf (the value of EAX passed to the CPUID instruction) for
+ * "Advanced Power Management Information", and the bit of EDX that it
+ * sets if the TSC is invariant, i.e. ticks at a constant rate regardless
+ * of frequency scaling and power states (P-, C- and T-states).
+ *
+ * Note: the meaning of each bit depends on the leaf, e.g. bit 8 of EDX
+ * means something else entirely for leaf 7 (structured extended
+ * features).
+ *
+ * References:
+ *     Intel 64 and IA-32 Architectures Software Developer's Manual,
+ *     Vol. 2A, CPUID, "Initial EAX Value 80000007H" (and Vol. 3B,
+ *     section "Invariant TSC");
+ *     AMD64 Architecture Programmer's Manual, Vol. 3, appendix E,
+ *     "CPUID Fn8000_0007_EDX", bit 8 "TscInvariant";
+ *     Linux's X86_FEATURE_CONSTANT_TSC and X86_FEATURE_NONSTOP_TSC,
+ *     which are set from the same bit (arch/x86/kernel/cpu/).
+ */
+#define CPUID_LEAF_POWER_MANAGEMENT 0x80000007u
+#define CPUID_EDX_INVARIANT_TSC (1u << 8)
+
+/*
  * Whether the TSC ticks at a constant rate (regardless of frequency
  * scaling and power states), and the kernel trusts it as its clock source
  * (which it doesn't when e.g. the TSCs aren't synchronized between CPUs,
@@ -113,8 +135,10 @@ tsc_is_reliable(void)
         unsigned int eax, ebx, ecx, edx;
         char clocksource[64] = {0};
         FILE *f;
-        if (!__get_cpuid(0x80000007, &eax, &ebx, &ecx, &edx)
-                        || !(edx & (1u << 8)))
+        /* (__get_cpuid() fails if the CPU doesn't have the leaf) */
+        if (!__get_cpuid(CPUID_LEAF_POWER_MANAGEMENT,
+                         &eax, &ebx, &ecx, &edx)
+                        || !(edx & CPUID_EDX_INVARIANT_TSC))
                 return 0;
         f = fopen("/sys/devices/system/clocksource/clocksource0/"
                   "current_clocksource", "r");
