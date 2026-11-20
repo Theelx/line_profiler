@@ -392,7 +392,7 @@ datamodel.html#user-defined-functions
         self.disable_by_count()
 
     def __cinit__(self, *args, **kwargs):
-        self._disabled_threads = set()
+        self._threads_with_last_time = set()
         self._ticks_to_units = 1.0
 
     @property
@@ -463,7 +463,7 @@ datamodel.html#user-defined-functions
         cdef const LastLine *last
         cdef size_t i
         cdef unsigned long ident = PyThread_get_thread_ident()
-        has_data = ident in self._disabled_threads
+        has_data = ident in self._threads_with_last_time
         c_last_time = {}
         for i in range(self._entries.size()):
             entry = self._entries[i]

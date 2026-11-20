@@ -7,8 +7,7 @@ cdef extern from "c_trace_callbacks.h":
 
 
 cdef class _SysMonitoringState:
-    cdef int tool_id
-    cdef object tool_id_obj  # (The same as a Python int)
+    cdef object tool_id  # type: int
     cdef object name  # type: str | None
     # The following are per line-tracing event (`LINE`, `PY_RETURN`,
     # `PY_YIELD`, `RAISE`, and `RERAISE`, in that order):

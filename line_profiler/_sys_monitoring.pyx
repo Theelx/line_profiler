@@ -111,7 +111,6 @@ cdef class _SysMonitoringState:
 
     def __init__(self, tool_id: int):
         self.tool_id = tool_id
-        self.tool_id_obj = tool_id
         self.name = None
         self.own_callbacks = [None] * _NUM_LINE_TRACING_EVENTS
         self.callbacks = [None] * _NUM_LINE_TRACING_EVENTS
@@ -218,12 +217,12 @@ cdef class _SysMonitoringState:
         # Callback should not receive the event (only check the local
         # events if the global ones don't include it)
         if not (self.events & event_id):
-            if not (_get_local_events(self.tool_id_obj, code) & event_id):
+            if not (_get_local_events(self.tool_id, code) & event_id):
                 return
 
         arg_tuple = (code, loc, arg) if has_arg else code_location
         try:
-            events_before = _get_events(self.tool_id_obj)
+            events_before = _get_events(self.tool_id)
             result = PyObject_Call(  # Note: DECREF needed below
                 <PyObject *>callback, <PyObject *>arg_tuple, NULL)
         else:
@@ -238,7 +237,7 @@ cdef class _SysMonitoringState:
         finally:
             Py_XDECREF(result)
             # Update the events
-            events_after = _get_events(self.tool_id_obj)
+            events_after = _get_events(self.tool_id)
             self.events = _patch_events(
                 self.events, events_before, events_after)
             # If the wrapped callback has replaced any of our callbacks:
@@ -246,16 +245,16 @@ cdef class _SysMonitoringState:
             # - Remember the replacement as the callback to wrap
             for i in range(_NUM_LINE_TRACING_EVENTS):
                 callback_after = _register_callback(
-                    self.tool_id_obj, _LINE_TRACING_EVENT_ID_OBJS[i],
+                    self.tool_id, _LINE_TRACING_EVENT_ID_OBJS[i],
                     self.own_callbacks[i])
                 if callback_after is not self.own_callbacks[i]:
                     self.callbacks[i] = callback_after
             # Reset the tool ID lock if released
-            if not _get_tool(self.tool_id_obj):
-                _use_tool_id(self.tool_id_obj, 'line_profiler')
+            if not _get_tool(self.tool_id):
+                _use_tool_id(self.tool_id, 'line_profiler')
                 reacquired = True
             # Restore the `sys.monitoring` events if unset
             if reacquired or events_after != (
                     self.events | _LINE_TRACING_EVENTS):
-                _set_events(self.tool_id_obj,
+                _set_events(self.tool_id,
                             self.events | _LINE_TRACING_EVENTS)

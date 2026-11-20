@@ -1836,6 +1836,51 @@ def test_line_storage_far_down_in_file(tracing_core):
         'plain': 1, 'divide': 2, 'zero': 1, 'yield': 3, 'start': 1, 'end': 1}
 
 
+def test_line_index_rebuilt(tracing_core):
+    """
+    Test that the line index of a profiler's data for a code block is
+    rebuilt when lines are registered below its first line, and switched
+    to a sorted vector when they are too far apart, by adding to the
+    profiler copies of a profiled function moved up and down the file
+    (which have the same bytecode, and thus share the data).
+    """
+    namespace, tags = _exec_tagged(
+        'def func(n):\n'
+        '    x = n + 1  # add\n'
+        '    return x  # return\n', 1000, '<twins>')
+    func = namespace['func']
+    prof = LineProfiler(func)  # Pads the bytecode
+    code = func.__code__
+    funcs = [func]
+
+    def add_twin(shift):
+        twin_code = code.replace(co_firstlineno=code.co_firstlineno + shift)
+        twin = types.FunctionType(twin_code, {})
+        prof.add_function(twin)
+        assert twin.__code__.co_code == code.co_code
+        funcs.append(twin)
+        return prof._line_slots
+
+    # There's only one block, so one table or none
+    _, ndense = prof._line_slots
+    assert ndense == 1
+    # Below the first line: the table is rebuilt
+    _, ndense = add_twin(-10)
+    assert ndense == 1
+    # Far below the last line: switched to a sorted vector
+    slots, ndense = add_twin(5000)
+    assert ndense == 0
+    assert slots < 100, slots
+    with prof:
+        for f in funcs:
+            assert f(1) == 2
+    timings = prof.get_stats().timings
+    for f, shift in zip(funcs, [0, -10, 5000]):
+        hits = {lineno: nhits for lineno, nhits, _ in
+                timings[_line_profiler.label(f.__code__)]}
+        assert hits == {tags['add'] + shift: 1, tags['return'] + shift: 1}
+
+
 def test_add_function_during_execution(tracing_core):
     """
     Test that the lines run by the frames of a function after it is

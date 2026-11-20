@@ -1089,7 +1089,7 @@ cdef class LineProfiler(_LineProfilerBase):
         # their times)
         for i in range(self._entries.size()):
             self._entries[i].clear_last_lines(ident)
-        self._disabled_threads.add(ident)
+        self._threads_with_last_time.add(ident)
         self._manager._handle_disable_event(self)
 
     def get_stats(self):

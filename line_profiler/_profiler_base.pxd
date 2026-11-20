@@ -34,9 +34,11 @@ cdef class _LineProfilerBase:
     # The profiling data of each code block (owned by the instance; also
     # referenced by the blocks in the registry in _line_profiler.pyx)
     cdef vector[ProfileEntry *] _entries
-    # Idents of the threads on which the profiler has been disabled (see
-    # .c_last_time)
-    cdef set _disabled_threads
+    # Idents of the threads on which .c_last_time gives a (possibly
+    # empty) mapping, even without any last-line records: those on which
+    # the profiler has ever been disabled (to keep the behavior from when
+    # disable() created an empty record for the thread); never shrinks
+    cdef set _threads_with_last_time
     # Factor converting the raw timings to .timer_units
     cdef double _ticks_to_units
     cdef public list functions
